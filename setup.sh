@@ -40,6 +40,8 @@ is_standard_env_key() {
 normalize_env_file() {
   [ -f "$ENV_FILE" ] || return
 
+  # Load existing values and rewrite .env in a deterministic order.
+  # This keeps generated keys grouped together after init/init cf/reset/env.
   load_env_if_exists
 
   local tmp line key val seen
@@ -166,7 +168,7 @@ rename_project_dir_if_needed() {
   SCRIPT_DIR="$target_dir"
   cd "$SCRIPT_DIR"
   log "INIT" "Project directory renamed to: ${target_name}"
-  log "INIT" "cd to ${target_dir}" before runing docker!
+  log "INIT" "Change directory before docker commands: cd ${target_dir}"
 }
 
 prompt_directory_rename() {
@@ -363,6 +365,8 @@ verify_primary_domain_zone() {
   local primary_domain="$1"
   local cert_zone_id cert_api_token cert_zone_name
 
+  # Validate that the active cloudflared certificate can manage
+  # the requested PRIMARY_DOMAIN before creating DNS routes.
   command -v python3 >/dev/null 2>&1 || die "python3 is required for Cloudflare zone verification"
 
   cert_zone_id=$(extract_cf_cert_field "zoneID" || true)
@@ -439,6 +443,8 @@ route_dns_record() {
   local output
 
   output=$(cloudflared tunnel route dns --overwrite-dns "$tunnel_ref" "$hostname" 2>&1) && {
+    # cloudflared can append the login zone to the requested host.
+    # Detect this and flag it as zone mismatch for a relogin flow.
     if printf '%s' "$output" | grep -Fq "${hostname}."; then
       log "CF" "WARN: route mapped outside expected zone for ${hostname}"
       printf '%s\n' "$output" >&2
@@ -556,6 +562,7 @@ create_tunnel_and_store_token() {
   
   log "CF" "Tunnel target: name=${tunnel_name} id=${tunnel_id}"
 
+  # Persist token before DNS setup so runtime remains usable even if DNS needs manual correction.
   token=$(cloudflared tunnel token "$tunnel_id" 2>/dev/null | tr -d '\r\n' || true)
   if [ -z "$token" ]; then
     token=$(cloudflared tunnel token "$tunnel_name" 2>/dev/null | tr -d '\r\n' || true)
@@ -1091,6 +1098,7 @@ reborn_command() {
   local force="${1:-}"
 
   if [ "$force" != "--yes" ] && [ "$force" != "--fuckit" ]; then
+    # Explicit confirmation because this removes almost all project files.
     local confirmation
     read -r -p "This removes generated files. Type 'reborn' to continue: " confirmation
     [ "$confirmation" = "reborn" ] || die "Cancelled"
