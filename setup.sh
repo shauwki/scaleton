@@ -28,6 +28,79 @@ shell_quote() {
   printf "'%s'" "$value"
 }
 
+is_standard_env_key() {
+  case "$1" in
+    TZ|STACK_ID|PRIMARY_DOMAIN|CLOUDFLARE_TUNNEL_TOKEN|CLOUDFLARE_TUNNEL_NAME|CLOUDFLARE_TUNNEL_ID|TRAEFIK_BASIC_AUTH_USER|POSTGRES_DB|POSTGRES_USER|POSTGRES_PASSWORD|APP_SECRET|APP_PASSWORD)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+normalize_env_file() {
+  [ -f "$ENV_FILE" ] || return
+
+  load_env_if_exists
+
+  local tmp line key val seen
+  local extras=()
+  tmp=$(mktemp)
+  seen=""
+
+  cat > "$tmp" <<EOF
+TZ=$(shell_quote "${TZ:-Europe/Amsterdam}")
+
+# Unique compose project id (used for isolation)
+STACK_ID=$(shell_quote "${STACK_ID:-scaleton}")
+
+# Primary domain for this stack
+PRIMARY_DOMAIN=$(shell_quote "${PRIMARY_DOMAIN:-example.com}")
+
+# Cloudflare tunnel settings
+CLOUDFLARE_TUNNEL_TOKEN=$(shell_quote "${CLOUDFLARE_TUNNEL_TOKEN:-}")
+CLOUDFLARE_TUNNEL_NAME=$(shell_quote "${CLOUDFLARE_TUNNEL_NAME:-}")
+CLOUDFLARE_TUNNEL_ID=$(shell_quote "${CLOUDFLARE_TUNNEL_ID:-}")
+
+# Traefik dashboard basic auth username
+TRAEFIK_BASIC_AUTH_USER=$(shell_quote "${TRAEFIK_BASIC_AUTH_USER:-admin}")
+
+# Postgres base credentials
+POSTGRES_DB=$(shell_quote "${POSTGRES_DB:-scaleton_db}")
+POSTGRES_USER=$(shell_quote "${POSTGRES_USER:-admin}")
+POSTGRES_PASSWORD=$(shell_quote "${POSTGRES_PASSWORD:-}")
+
+# App credentials
+APP_SECRET=$(shell_quote "${APP_SECRET:-}")
+APP_PASSWORD=$(shell_quote "${APP_PASSWORD:-}")
+EOF
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^([A-Z0-9_]+)= ]]; then
+      key="${BASH_REMATCH[1]}"
+      if ! is_standard_env_key "$key"; then
+        extras+=("$key")
+      fi
+    fi
+  done < "$ENV_FILE"
+
+  if [ "${#extras[@]}" -gt 0 ]; then
+    printf '\n# Custom variables\n' >> "$tmp"
+    for key in "${extras[@]}"; do
+      case " $seen " in
+        *" $key "*)
+          continue
+          ;;
+      esac
+      seen="${seen}${key} "
+      val="${!key:-}"
+      printf '%s=%s\n' "$key" "$(shell_quote "$val")" >> "$tmp"
+    done
+  fi
+
+  mv "$tmp" "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+}
+
 random_lower_alnum() {
   local len="$1"
   local out=""
@@ -488,6 +561,7 @@ create_tunnel_and_store_token() {
   set_env_var "CLOUDFLARE_TUNNEL_TOKEN" "$token"
   set_env_var "CLOUDFLARE_TUNNEL_NAME" "$tunnel_name"
   set_env_var "CLOUDFLARE_TUNNEL_ID" "$tunnel_id"
+  normalize_env_file
   log "CF" "Stored tunnel token in .env"
 
   configure_dns_routes "$tunnel_id" "$PRIMARY_DOMAIN"
@@ -635,12 +709,14 @@ EOF
 write_gitignore_file() {
   cat > "${SCRIPT_DIR}/.gitignore" <<'EOF'
 .env
-
+.gitignore
 # Generated security files
 core/traefik/users.htpasswd
-
+core/**
+compose.yaml
 # Runtime data
 services/postgres/data/**
+services/**
 *.log
 *.tmp
 EOF
@@ -743,8 +819,10 @@ STACK_ID='scaleton'
 # Primary domain for this stack
 PRIMARY_DOMAIN='example.com'
 
-# Cloudflare tunnel token (required for public routing)
+# Cloudflare tunnel settings
 CLOUDFLARE_TUNNEL_TOKEN=''
+CLOUDFLARE_TUNNEL_NAME=''
+CLOUDFLARE_TUNNEL_ID=''
 
 # Traefik dashboard basic auth username
 TRAEFIK_BASIC_AUTH_USER='admin'
@@ -762,6 +840,8 @@ EOF
     chmod 600 "$ENV_FILE"
     log "INIT" ".env created"
   fi
+
+  normalize_env_file
 }
 
 load_env() {
@@ -975,6 +1055,7 @@ env_command() {
 
   mv "$tmp" "$ENV_FILE"
   chmod 600 "$ENV_FILE"
+  normalize_env_file
   log "ENV" "Secret rotation complete"
 }
 
@@ -993,6 +1074,7 @@ reset_command() {
       local db_password
       db_password=$(prompt_secret "New database password")
       set_env_var "POSTGRES_PASSWORD" "$db_password"
+      normalize_env_file
       log "RESET" "Database password updated in .env"
       ;;
     *)
@@ -1072,6 +1154,7 @@ init_command() {
   set_env_var "POSTGRES_PASSWORD" "$postgres_password"
   set_env_var "APP_SECRET" "$app_secret"
   set_env_var "APP_PASSWORD" "$app_password"
+  normalize_env_file
 
   load_env
   ensure_stack_networks "$STACK_ID"
