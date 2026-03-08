@@ -166,8 +166,7 @@ rename_project_dir_if_needed() {
   SCRIPT_DIR="$target_dir"
   cd "$SCRIPT_DIR"
   log "INIT" "Project directory renamed to: ${target_name}"
-  # log "INIT" "Switch shell dir with: cd ${target_dir}"
-  cd "$target_dir"
+  log "INIT" "cd to ${target_dir}" before runing docker!
 }
 
 prompt_directory_rename() {
