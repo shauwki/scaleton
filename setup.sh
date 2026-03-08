@@ -139,7 +139,7 @@ default_tunnel_name() {
 
 rename_project_dir_if_needed() {
   local target_name="$1"
-  local current_name parent_dir target_dir old_path
+  local current_name parent_dir target_dir
 
   [ -n "$target_name" ] || return
   current_name="$(basename "$SCRIPT_DIR")"
@@ -156,7 +156,6 @@ rename_project_dir_if_needed() {
 
   parent_dir="$(dirname "$SCRIPT_DIR")"
   target_dir="${parent_dir}/${target_name}"
-  old_path="${parent_dir}/${current_name}"
 
   if [ -e "$target_dir" ]; then
     die "Cannot rename folder; target already exists: ${target_dir}"
@@ -164,14 +163,10 @@ rename_project_dir_if_needed() {
 
   mv "$SCRIPT_DIR" "$target_dir"
 
-  # Keep old path usable for the current shell session.
-  # A child script cannot change the parent shell's cwd, so this symlink
-  # prevents a broken cwd after rename.
-  ln -s "$target_name" "$old_path" 2>/dev/null || true
-
   SCRIPT_DIR="$target_dir"
   cd "$SCRIPT_DIR"
   log "INIT" "Project directory renamed to: ${target_name}"
+  log "INIT" "Switch shell dir with: cd ${target_dir}"
 }
 
 prompt_directory_rename() {
