@@ -1026,14 +1026,14 @@ reborn_command() {
   keep_name="$(basename "$0")"
   for path in "${SCRIPT_DIR}"/*; do
     base="$(basename "$path")"
-    if [ "$base" = ".git" ] || [ "$base" = "$keep_name" ] || [ "$base" = "README.md" ]; then
+    if [ "$base" = ".git" ] || [ "$base" = "$keep_name" ] || [ "$base" = "README.md" ] || [ "$base" = "LICENSE" ]; then
       continue
     fi
     rm -rf "$path"
   done
   shopt -u dotglob nullglob
 
-  log "REBIRTH" "Project fully reset. Kept: ${keep_name}, README.md, .git"
+  log "REBIRTH" "Project fully reset. Kept: ${keep_name}, README.md, .git, LICENSE"
 }
 
 init_command() {
@@ -1122,7 +1122,7 @@ Commands:
   env                          Regenerate values for every *_SECRET key in .env
   validate                     Validate .env and docker compose config
   reset <database|trae>        Reset database password or Traefik password
-  reborn [--yes|--fuckit]      Remove generated files, keep setup.sh README.md and .git
+  reborn [--yes|--fuckit]      Remove generated files, keep setup.sh README.md .git LICENSE
   help | -h                    Show this help
 EOF
 }
