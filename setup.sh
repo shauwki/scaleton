@@ -31,7 +31,7 @@ shell_quote() {
 
 is_standard_env_key() {
   case "$1" in
-    TZ|STACK_ID|PRIMARY_DOMAIN|CLOUDFLARE_TUNNEL_TOKEN|CLOUDFLARE_TUNNEL_NAME|CLOUDFLARE_TUNNEL_ID|TRAEFIK_BASIC_AUTH_USER|POSTGRES_DB|POSTGRES_USER|POSTGRES_PASSWORD|APP_SECRET|APP_PASSWORD)
+    TZ|STACK_ID|PRIMARY_DOMAIN|CLOUDFLARE_TUNNEL_TOKEN|CLOUDFLARE_TUNNEL_NAME|CLOUDFLARE_TUNNEL_ID|TRAEFIK_BASIC_AUTH_USER|POSTGRES_DB|POSTGRES_USER|POSTGRES_PASSWORD|APP_SECRET|APP_PASSWORD|INIT_DONE|CF_DONE)
       return 0
       ;;
   esac
@@ -42,7 +42,7 @@ normalize_env_file() {
   [ -f "$ENV_FILE" ] || return
 
   # Load existing values and rewrite .env in a deterministic order.
-  # This keeps generated keys grouped together after init/init cf/reset/env.
+  # This keeps generated keys grouped together after init/init cf/reset/renew.
   load_env_if_exists
 
   local tmp line key val seen
@@ -75,6 +75,10 @@ POSTGRES_PASSWORD=$(shell_quote "${POSTGRES_PASSWORD:-}")
 # App credentials
 APP_SECRET=$(shell_quote "${APP_SECRET:-}")
 APP_PASSWORD=$(shell_quote "${APP_PASSWORD:-}")
+
+# Setup state flags
+INIT_DONE=$(shell_quote "${INIT_DONE:-0}")
+CF_DONE=$(shell_quote "${CF_DONE:-0}")
 EOF
 
   while IFS= read -r line || [ -n "$line" ]; do
@@ -529,8 +533,7 @@ ensure_initialized_for_cf() {
     return
   fi
 
-  log "CF" "Base init missing; running ${SCRIPT_NAME} init first"
-  init_command "--no-rename"
+  die "Base init is incomplete. Run ${SCRIPT_NAME} init first"
 }
 
 create_tunnel_and_store_token() {
@@ -849,6 +852,10 @@ POSTGRES_PASSWORD='${postgres_password}'
 # App credentials
 APP_SECRET='${app_secret}'
 APP_PASSWORD='${app_password}'
+
+# Setup state flags
+INIT_DONE='0'
+CF_DONE='0'
 EOF
 
     chmod 600 "$ENV_FILE"
@@ -893,6 +900,44 @@ prompt_value() {
   else
     printf '%s' "$input"
   fi
+}
+
+prompt_yes_no() {
+  local prompt="$1"
+  local answer
+  read -r -p "${prompt} [y/N]: " answer
+  case "$answer" in
+    y|Y|yes|YES)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+require_init_done() {
+  ensure_env_file
+  load_env_if_exists
+  [ "${INIT_DONE:-0}" = "1" ] || die "Run ${SCRIPT_NAME} init first"
+}
+
+require_cf_done() {
+  ensure_env_file
+  load_env_if_exists
+  if [ "${CF_DONE:-0}" != "1" ]; then
+    die "Cloudflare setup is required. Run ${SCRIPT_NAME} init cf"
+  fi
+}
+
+renew_secrets_command() {
+  ensure_env_file
+  load_env
+
+  set_env_var "APP_SECRET" "$(random_lower_alnum 100)"
+  set_env_var "APP_PASSWORD" "$(random_lower_alnum 100)"
+  normalize_env_file
+  log "INIT" "App secrets renewed"
 }
 
 prompt_secret() {
@@ -1061,7 +1106,9 @@ resolve_snapshot_ids() {
   root="$(backup_snapshots_dir)"
 
   SNAPSHOT_IDS=()
-  [ -d "$root" ] || return
+  if [ ! -d "$root" ]; then
+    return 0
+  fi
 
   local dir base
   shopt -s nullglob
@@ -1077,6 +1124,8 @@ resolve_snapshot_ids() {
   if [ "${#SNAPSHOT_IDS[@]}" -gt 0 ]; then
     IFS=$'\n' SNAPSHOT_IDS=($(printf '%s\n' "${SNAPSHOT_IDS[@]}" | sort -r))
   fi
+
+  return 0
 }
 
 snapshot_dir_by_index() {
@@ -1293,6 +1342,7 @@ restore_command() {
   local idx=0
   local merge=0
   local force=0
+  local full=0
   local args=()
 
   if [ "$#" -gt 0 ] && [[ "$1" =~ ^[0-9]+$ ]]; then
@@ -1308,6 +1358,9 @@ restore_command() {
       --yes)
         force=1
         ;;
+      --full)
+        full=1
+        ;;
       *)
         args+=("$1")
         ;;
@@ -1315,11 +1368,28 @@ restore_command() {
     shift
   done
 
-  [ "${#args[@]}" -gt 0 ] || die "Usage: ${SCRIPT_NAME} restore [index] <path...> [--merge] [--yes]"
-
   local snapshot_dir snapshot_id path src dst
   snapshot_dir="$(snapshot_dir_by_index "$idx")"
   snapshot_id="$(basename "$snapshot_dir")"
+
+  if [ "$full" -eq 1 ]; then
+    if [ "${#args[@]}" -gt 0 ]; then
+      die "Usage: ${SCRIPT_NAME} restore [index] --full [--merge] [--yes]"
+    fi
+
+    local entry base
+    shopt -s nullglob
+    for entry in "$snapshot_dir"/*; do
+      base="$(basename "$entry")"
+      if [ "$base" = "manifest.json" ]; then
+        continue
+      fi
+      args+=("$base")
+    done
+    shopt -u nullglob
+  fi
+
+  [ "${#args[@]}" -gt 0 ] || die "Usage: ${SCRIPT_NAME} restore [index] <path...> [--merge] [--yes]"
 
   if [ "$force" -ne 1 ]; then
     local confirmation
@@ -1415,36 +1485,6 @@ harden_command() {
       die "Usage: ${SCRIPT_NAME} harden <audit>"
       ;;
   esac
-}
-
-gen_secret() {
-  random_lower_alnum 100
-}
-
-env_command() {
-  [ -f "$ENV_FILE" ] || die "Missing .env. Run ${SCRIPT_NAME} init first."
-  local tmp
-  tmp=$(mktemp)
-
-  while IFS= read -r line || [ -n "$line" ]; do
-    if [[ "$line" =~ ^([A-Z0-9_]+)= ]]; then
-      local key
-      key="${BASH_REMATCH[1]}"
-      if [[ "$key" == *_SECRET ]]; then
-        local secret
-        secret=$(gen_secret)
-        printf "%s=%s\n" "$key" "$(shell_quote "$secret")" >> "$tmp"
-        log "ENV" "Regenerated ${key}"
-        continue
-      fi
-    fi
-    printf '%s\n' "$line" >> "$tmp"
-  done < "$ENV_FILE"
-
-  mv "$tmp" "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-  normalize_env_file
-  log "ENV" "Secret rotation complete"
 }
 
 reset_command() {
@@ -1543,6 +1583,8 @@ init_command() {
   set_env_var "POSTGRES_PASSWORD" "$postgres_password"
   set_env_var "APP_SECRET" "$app_secret"
   set_env_var "APP_PASSWORD" "$app_password"
+  set_env_var "INIT_DONE" "1"
+  set_env_var "CF_DONE" "0"
   normalize_env_file
 
   load_env
@@ -1562,6 +1604,8 @@ init_command() {
   echo "- Compose project: ${stack_id}"
   echo "- Network: network-${stack_id}"
   echo "- Generated: .gitignore"
+  echo
+  log "NEXT" "Run ${SCRIPT_NAME} init cf (required before deploy commands)"
 
   if [ "$do_rename" -eq 1 ]; then
     prompt_directory_rename
@@ -1578,10 +1622,20 @@ init_cf_command() {
     die "Usage: ${SCRIPT_NAME} init cf [--relogin]"
   fi
 
+  require_init_done
   ensure_cloudflared
   ensure_cloudflared_login "$force_relogin"
   create_tunnel_and_store_token
+  set_env_var "CF_DONE" "1"
+  normalize_env_file
   log "CF" "Cloudflared tunnel init complete"
+
+  if prompt_yes_no "Run 'docker compose up -d' now?"; then
+    docker compose up -d || die "docker compose up -d failed"
+    log "CF" "Docker stack started"
+  else
+    log "CF" "Run ${SCRIPT_NAME} init cf completed. Next: docker compose up -d"
+  fi
 }
 
 print_help() {
@@ -1590,15 +1644,16 @@ Usage: ${SCRIPT_NAME} <command> [opts]
 
 Commands:
   init                         Interactive bootstrap for skeleton stack
+  init --renew                 Renew app secrets in .env
   init cf [--relogin]          Install/login cloudflared and store tunnel token
-  env                          Regenerate values for every *_SECRET key in .env
   validate                     Validate .env and docker compose config
   harden audit                 Run basic production hardening checks
   backup <path...>             Snapshot selected project paths
   backup --full                Snapshot whole project state
   backup list                  List snapshots (newest first)
   backup delete <idx...>       Delete snapshot(s) by list index
-  restore [idx] <path...>      Restore paths from snapshot index (0 = latest, --merge optional)
+  restore [idx] <path...>      Restore paths from snapshot index (0=latest, --merge optional)
+  restore [idx] --full         Restore full snapshot root (excluding manifest)
   security scan                Run Trivy filesystem/config scan
   reset <database|trae>        Reset database password or Traefik password
   reborn [--yes|--fuckit]      Remove generated files, keep setup.sh README.md .git LICENSE backups
@@ -1613,24 +1668,23 @@ main() {
         "")
           init_command
           ;;
-        env)
-          env_command
+        --renew)
+          renew_secrets_command
           ;;
         cf)
           init_cf_command "${3:-}"
           ;;
         *)
-          die "Usage: ${SCRIPT_NAME} init [cf|env]"
+          die "Usage: ${SCRIPT_NAME} init [cf [--relogin]|--renew]"
           ;;
       esac
       ;;
-    env)
-      env_command
-      ;;
     validate)
+      require_cf_done
       validate_stack
       ;;
     harden)
+      require_cf_done
       shift
       harden_command "$@"
       ;;
@@ -1643,10 +1697,12 @@ main() {
       restore_command "$@"
       ;;
     security)
+      require_cf_done
       shift
       security_command "$@"
       ;;
     reset)
+      require_cf_done
       shift
       reset_command "$@"
       ;;
