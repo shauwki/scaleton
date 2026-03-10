@@ -609,8 +609,7 @@ ensure_structure() {
   mkdir -p ./core/cloudflared
   mkdir -p ./core/testsite
   mkdir -p ./services/postgres/data
-  mkdir -p "${BACKUP_ROOT}/postgres"
-  mkdir -p "${BACKUP_ROOT}/files"
+  mkdir -p "${BACKUP_ROOT}/snapshots"
 }
 
 generate_testsite_files() {
@@ -1044,321 +1043,141 @@ validate_stack() {
   fi
 }
 
-postgres_is_running() {
-  docker compose ps --status running --services 2>/dev/null | grep -qx 'postgres'
+backup_snapshots_dir() {
+  printf '%s' "${BACKUP_ROOT}/snapshots"
 }
 
-wait_for_postgres_ready() {
-  local i
-  for i in $(seq 1 30); do
-    if docker compose exec -T postgres sh -c 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null 2>&1; then
-      return
+timestamp_to_human() {
+  local ts="$1"
+  local y m d hh mm ss iso
+  y="${ts:0:4}"; m="${ts:4:2}"; d="${ts:6:2}"
+  hh="${ts:9:2}"; mm="${ts:11:2}"; ss="${ts:13:2}"
+  iso="${y}-${m}-${d} ${hh}:${mm}:${ss}"
+  printf '%s' "$iso"
+}
+
+resolve_snapshot_ids() {
+  local root
+  root="$(backup_snapshots_dir)"
+
+  SNAPSHOT_IDS=()
+  [ -d "$root" ] || return
+
+  local dir base
+  shopt -s nullglob
+  for dir in "$root"/*; do
+    [ -d "$dir" ] || continue
+    base="$(basename "$dir")"
+    if [[ "$base" =~ ^[0-9]{8}-[0-9]{6}$ ]]; then
+      SNAPSHOT_IDS+=("$base")
     fi
-    sleep 1
   done
-  die "postgres did not become ready in time"
-}
+  shopt -u nullglob
 
-checksum_file_for() {
-  local file="$1"
-  local checksum_file="${file}.sha256"
-
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$file" > "$checksum_file"
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$file" > "$checksum_file"
+  if [ "${#SNAPSHOT_IDS[@]}" -gt 0 ]; then
+    IFS=$'\n' SNAPSHOT_IDS=($(printf '%s\n' "${SNAPSHOT_IDS[@]}" | sort -r))
   fi
 }
 
-backup_paths_root() {
-  printf '%s' "${BACKUP_ROOT}/${STACK_ID}"
+snapshot_dir_by_index() {
+  local idx="$1"
+  resolve_snapshot_ids
+  [ "${#SNAPSHOT_IDS[@]}" -gt 0 ] || die "No snapshots found"
+  [ "$idx" -ge 0 ] || die "Snapshot index must be >= 0"
+  [ "$idx" -lt "${#SNAPSHOT_IDS[@]}" ] || die "Snapshot index out of range (max: $((${#SNAPSHOT_IDS[@]} - 1)))"
+  printf '%s/%s' "$(backup_snapshots_dir)" "${SNAPSHOT_IDS[$idx]}"
 }
 
-backup_latest_archive() {
-  local root="$1"
-  local latest=""
-  local files=()
-  shopt -s globstar nullglob
-  files=("$root"/**/*.tar.gz "$root"/**/*.sql.gz)
-  shopt -u globstar nullglob
-  if [ "${#files[@]}" -gt 0 ]; then
-    latest=$(printf '%s\n' "${files[@]}" | sort | tail -n1)
-  fi
-  printf '%s' "$latest"
-}
-
-backup_latest_db_archive() {
-  local root="$1"
-  local latest=""
-  local files=()
-  shopt -s globstar nullglob
-  files=("$root"/postgres/logical/*.sql.gz "$root"/postgres/physical/*.tar.gz)
-  shopt -u globstar nullglob
-  if [ "${#files[@]}" -gt 0 ]; then
-    latest=$(printf '%s\n' "${files[@]}" | sort | tail -n1)
-  fi
-  printf '%s' "$latest"
-}
-
-backup_run_physical_postgres() {
-  local stack_root="$1"
-  local timestamp="$2"
-  local out_file tmp_file was_running=0
-  out_file="${stack_root}/postgres/physical/${STACK_ID}-${POSTGRES_DB}-${timestamp}.tar.gz"
-  tmp_file="${out_file}.tmp"
-
-  mkdir -p "${stack_root}/postgres/physical"
-
-  if postgres_is_running; then
-    was_running=1
-    log "BACKUP" "Stopping postgres for consistent physical snapshot"
-    docker compose stop postgres >/dev/null 2>&1 || die "Could not stop postgres for physical backup"
-  fi
-
-  if ! tar -C "${SCRIPT_DIR}/services/postgres" -czf "$tmp_file" data; then
-    [ "$was_running" -eq 1 ] && docker compose start postgres >/dev/null 2>&1 || true
-    rm -f "$tmp_file"
-    die "Failed to create physical postgres backup"
-  fi
-
-  if [ "$was_running" -eq 1 ]; then
-    docker compose start postgres >/dev/null 2>&1 || die "Could not restart postgres after physical backup"
-  fi
-
-  [ -s "$tmp_file" ] || die "Physical backup is empty"
-  if ! gzip -t "$tmp_file"; then
-    rm -f "$tmp_file"
-    die "Physical backup archive is invalid"
-  fi
-
-  mv "$tmp_file" "$out_file"
-  checksum_file_for "$out_file"
-  log "BACKUP" "Created physical backup: ${out_file}"
-}
-
-backup_run_logical_postgres() {
-  local stack_root="$1"
-  local timestamp="$2"
-  local auto_start="$3"
-  local out_file tmp_file started_here=0
-  out_file="${stack_root}/postgres/logical/${STACK_ID}-${POSTGRES_DB}-${timestamp}.sql.gz"
-  tmp_file="${out_file}.tmp"
-
-  mkdir -p "${stack_root}/postgres/logical"
-
-  if ! postgres_is_running; then
-    if [ "$auto_start" -eq 1 ]; then
-      log "BACKUP" "Starting postgres for logical backup"
-      docker compose up -d postgres >/dev/null 2>&1 || die "Could not start postgres for logical backup"
-      started_here=1
-      wait_for_postgres_ready
-    else
-      die "service 'postgres' is not running (use --auto-start or --physical)"
-    fi
-  fi
-
-  if ! docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB"' | gzip -9 > "$tmp_file"; then
-    [ "$started_here" -eq 1 ] && docker compose stop postgres >/dev/null 2>&1 || true
-    rm -f "$tmp_file"
-    die "Logical backup failed while dumping database"
-  fi
-
-  if [ "$started_here" -eq 1 ]; then
-    docker compose stop postgres >/dev/null 2>&1 || true
-  fi
-
-  [ -s "$tmp_file" ] || die "Logical backup is empty"
-  if ! gzip -t "$tmp_file"; then
-    rm -f "$tmp_file"
-    die "Logical backup archive is invalid"
-  fi
-
-  mv "$tmp_file" "$out_file"
-  checksum_file_for "$out_file"
-  log "BACKUP" "Created logical backup: ${out_file}"
-}
-
-backup_run_command() {
-  ensure_env_file
-  load_env
-  ensure_structure
-  command -v docker >/dev/null 2>&1 || die "docker is required for backups"
-
-  local mode="physical"
-  local auto_start=0
-  local arg
-  for arg in "$@"; do
-    case "$arg" in
-      --physical)
-        mode="physical"
-        ;;
-      --logical)
-        mode="logical"
-        ;;
-      --full)
-        mode="full"
-        ;;
-      --auto-start)
-        auto_start=1
-        ;;
-      *)
-        die "Usage: ${SCRIPT_NAME} backup run [--physical|--logical|--full] [--auto-start]"
-        ;;
-    esac
-  done
-
-  local stack_root timestamp
-  stack_root="$(backup_paths_root)"
-  mkdir -p "$stack_root"
-  timestamp="$(date +%Y%m%d-%H%M%S)"
-
-  case "$mode" in
-    physical)
-      backup_run_physical_postgres "$stack_root" "$timestamp"
+validate_project_relative_path() {
+  local p="$1"
+  [ -n "$p" ] || die "Empty path is not allowed"
+  case "$p" in
+    /*)
+      die "Path must be relative to project root: ${p}"
       ;;
-    logical)
-      backup_run_logical_postgres "$stack_root" "$timestamp" "$auto_start"
+    *..*)
+      die "Path cannot contain '..': ${p}"
       ;;
-    full)
-      backup_run_physical_postgres "$stack_root" "$timestamp"
-      backup_run_logical_postgres "$stack_root" "$timestamp" 1
+    backups|backups/*)
+      die "Path inside backups is not allowed: ${p}"
+      ;;
+    .git|.git/*)
+      die "Path inside .git is not allowed: ${p}"
       ;;
   esac
 }
 
-backup_list_command() {
-  ensure_env_file
+copy_path_into_snapshot() {
+  local path="$1"
+  local snapshot_dir="$2"
+  local src dst_parent
+
+  validate_project_relative_path "$path"
+  src="${SCRIPT_DIR}/${path}"
+  [ -e "$src" ] || die "Path not found: ${path}"
+
+  dst_parent="${snapshot_dir}/$(dirname "$path")"
+  mkdir -p "$dst_parent"
+  cp -a "$src" "$dst_parent/"
+}
+
+write_snapshot_manifest() {
+  local snapshot_dir="$1"
+  local mode="$2"
+  shift 2
+  local paths=("$@")
+
   load_env_if_exists
 
-  local stack_root
-  stack_root="$(backup_paths_root)"
+  {
+    printf '{\n'
+    printf '  "timestamp": "%s",\n' "$(basename "$snapshot_dir")"
+    printf '  "mode": "%s",\n' "$mode"
+    printf '  "stack_id": "%s",\n' "${STACK_ID:-}"
+    printf '  "primary_domain": "%s",\n' "${PRIMARY_DOMAIN:-}"
+    printf '  "paths": ['
+    local i
+    for i in "${!paths[@]}"; do
+      if [ "$i" -gt 0 ]; then
+        printf ', '
+      fi
+      printf '"%s"' "${paths[$i]}"
+    done
+    printf ']\n'
+    printf '}\n'
+  } > "${snapshot_dir}/manifest.json"
+}
 
-  if [ ! -d "$stack_root" ]; then
-    log "BACKUP" "No backup directory yet: ${stack_root}"
-    return
-  fi
+backup_create_snapshot() {
+  local mode="$1"
+  shift
+  local paths=("$@")
 
-  local f shown=0
-  shopt -s globstar nullglob
-  for f in "$stack_root"/**/*.sql.gz "$stack_root"/**/*.tar.gz; do
-    if [ -s "$f" ] && gzip -t "$f" >/dev/null 2>&1; then
-      printf '%s\n' "${f#${stack_root}/}"
-      shown=1
+  ensure_structure
+  local snapshot_id snapshot_dir
+  while true; do
+    snapshot_id="$(date +%Y%m%d-%H%M%S)"
+    snapshot_dir="$(backup_snapshots_dir)/${snapshot_id}"
+    if [ ! -e "$snapshot_dir" ]; then
+      break
     fi
+    sleep 1
   done
-  shopt -u globstar nullglob
+  snapshot_dir="$(backup_snapshots_dir)/${snapshot_id}"
+  mkdir -p "$snapshot_dir"
 
-  if [ "$shown" -eq 0 ]; then
-    log "BACKUP" "No valid backup archives found in: ${stack_root}"
-  fi
+  local p
+  for p in "${paths[@]}"; do
+    copy_path_into_snapshot "$p" "$snapshot_dir"
+  done
+
+  write_snapshot_manifest "$snapshot_dir" "$mode" "${paths[@]}"
+  log "BACKUP" "Snapshot created: ${snapshot_id}"
 }
 
-backup_verify_command() {
-  ensure_env_file
-  load_env_if_exists
-
-  local target="${1:-}"
-  local stack_root checksum_file
-  stack_root="$(backup_paths_root)"
-
-  [ -d "$stack_root" ] || die "No backups found"
-
-  if [ -z "$target" ]; then
-    target=$(backup_latest_archive "$stack_root")
-  fi
-
-  [ -n "$target" ] || die "No backup archives found"
-  if [ ! -f "$target" ] && [ -f "${stack_root}/${target}" ]; then
-    target="${stack_root}/${target}"
-  fi
-  [ -f "$target" ] || die "Backup archive not found: ${target}"
-
-  gzip -t "$target" || die "Backup archive is corrupted: ${target}"
-  checksum_file="${target}.sha256"
-
-  if [ -f "$checksum_file" ]; then
-    if command -v sha256sum >/dev/null 2>&1; then
-      sha256sum -c "$checksum_file" >/dev/null || die "Checksum mismatch for ${target}"
-    elif command -v shasum >/dev/null 2>&1; then
-      shasum -a 256 -c "$checksum_file" >/dev/null || die "Checksum mismatch for ${target}"
-    fi
-  fi
-
-  log "BACKUP" "Verified: ${target}"
-}
-
-backup_restore_sql_command() {
-  local backup_file="$1"
-  local auto_start="$2"
-  local started_here=0
-
-  if ! postgres_is_running; then
-    if [ "$auto_start" -eq 1 ]; then
-      log "BACKUP" "Starting postgres for SQL restore"
-      docker compose up -d postgres >/dev/null 2>&1 || die "Could not start postgres for restore"
-      started_here=1
-      wait_for_postgres_ready
-    else
-      die "service 'postgres' is not running (use --auto-start)"
-    fi
-  fi
-
-  gunzip -c "$backup_file" | docker compose exec -T postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
-
-  if [ "$started_here" -eq 1 ]; then
-    docker compose stop postgres >/dev/null 2>&1 || true
-  fi
-}
-
-backup_restore_physical_postgres_command() {
-  local backup_file="$1"
-  local stack_root="$2"
-  local was_running=0
-  local rollback_file rollback_tmp ts
-
-  # Safety net: capture current data directory before overwriting.
-  if [ -d "${SCRIPT_DIR}/services/postgres/data" ]; then
-    ts="$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "${stack_root}/postgres/pre-restore"
-    rollback_file="${stack_root}/postgres/pre-restore/${STACK_ID}-${POSTGRES_DB}-${ts}.tar.gz"
-    rollback_tmp="${rollback_file}.tmp"
-    tar -C "${SCRIPT_DIR}/services/postgres" -czf "$rollback_tmp" data || die "Could not create pre-restore rollback archive"
-    mv "$rollback_tmp" "$rollback_file"
-    checksum_file_for "$rollback_file"
-    log "BACKUP" "Saved pre-restore snapshot: ${rollback_file}"
-  fi
-
-  if postgres_is_running; then
-    was_running=1
-    log "BACKUP" "Stopping postgres for physical restore"
-    docker compose stop postgres >/dev/null 2>&1 || die "Could not stop postgres for physical restore"
-  fi
-
-  rm -rf "${SCRIPT_DIR}/services/postgres/data"
-  mkdir -p "${SCRIPT_DIR}/services/postgres"
-  tar -xzf "$backup_file" -C "${SCRIPT_DIR}/services/postgres" || die "Failed to extract physical backup"
-
-  [ -d "${SCRIPT_DIR}/services/postgres/data" ] || die "Physical restore did not recreate data directory"
-
-  if [ "$was_running" -eq 1 ]; then
-    if docker compose start postgres >/dev/null 2>&1; then
-      log "BACKUP" "Postgres restarted after physical restore"
-    else
-      log "BACKUP" "WARN: restore completed but postgres failed to start; run 'docker compose logs postgres'"
-    fi
-  fi
-}
-
-backup_restore_files_command() {
-  local backup_file="$1"
-  tar -xzf "$backup_file" -C "$SCRIPT_DIR" || die "Failed to restore file backup"
-}
-
-backup_restore_command() {
-  local backup_file=""
+backup_delete_command() {
   local force=0
-  local auto_start=0
-  local prefer_mode=""
+  local indexes=()
   local arg
 
   for arg in "$@"; do
@@ -1366,143 +1185,170 @@ backup_restore_command() {
       --yes)
         force=1
         ;;
-      --auto-start)
-        auto_start=1
-        ;;
-      --logical)
-        prefer_mode="logical"
-        ;;
-      --physical)
-        prefer_mode="physical"
-        ;;
       *)
-        if [ -z "$backup_file" ]; then
-          backup_file="$arg"
+        if [[ "$arg" =~ ^[0-9]+$ ]]; then
+          indexes+=("$arg")
         else
-          die "Usage: ${SCRIPT_NAME} backup restore [file] [--yes] [--auto-start] [--logical|--physical]"
+          die "Usage: ${SCRIPT_NAME} backup delete <index...> [--yes]"
         fi
         ;;
     esac
   done
 
-  ensure_env_file
-  load_env
-  ensure_structure
-  command -v docker >/dev/null 2>&1 || die "docker is required for restore"
+  [ "${#indexes[@]}" -gt 0 ] || die "Usage: ${SCRIPT_NAME} backup delete <index...> [--yes]"
 
-  if [ -z "$backup_file" ]; then
-    case "$prefer_mode" in
-      logical)
-        backup_file=$(backup_latest_db_archive "$(backup_paths_root)")
-        if [ -n "$backup_file" ] && [[ "$backup_file" != *.sql.gz ]]; then
-          backup_file=""
-        fi
-        ;;
-      physical)
-        backup_file=$(backup_latest_db_archive "$(backup_paths_root)")
-        if [ -n "$backup_file" ] && [[ "$backup_file" != */postgres/physical/*.tar.gz ]]; then
-          backup_file=""
-        fi
-        ;;
-      *)
-        backup_file=$(backup_latest_db_archive "$(backup_paths_root)")
-        ;;
-    esac
-    [ -n "$backup_file" ] || die "No backup archives found"
-  fi
+  resolve_snapshot_ids
+  [ "${#SNAPSHOT_IDS[@]}" -gt 0 ] || die "No snapshots found"
 
-  if [ ! -f "$backup_file" ] && [ -f "$(backup_paths_root)/${backup_file}" ]; then
-    backup_file="$(backup_paths_root)/${backup_file}"
-  fi
-
-  [ -f "$backup_file" ] || die "Backup file not found: ${backup_file}"
+  local idx max id path
+  max=$((${#SNAPSHOT_IDS[@]} - 1))
+  for idx in "${indexes[@]}"; do
+    [ "$idx" -le "$max" ] || die "Snapshot index out of range: ${idx} (max ${max})"
+  done
 
   if [ "$force" -ne 1 ]; then
+    printf 'Delete snapshots:'
+    for idx in "${indexes[@]}"; do
+      printf ' [%s]=%s' "$idx" "${SNAPSHOT_IDS[$idx]}"
+    done
+    printf '\n'
     local confirmation
-    read -r -p "Type 'restore' to continue restore from ${backup_file}: " confirmation
-    [ "$confirmation" = "restore" ] || die "Cancelled"
+    read -r -p "Type 'delete' to continue: " confirmation
+    [ "$confirmation" = "delete" ] || die "Cancelled"
   fi
 
-  gzip -t "$backup_file" || die "Backup archive is corrupted: ${backup_file}"
-
-  case "$backup_file" in
-    *.sql.gz)
-      backup_restore_sql_command "$backup_file" "$auto_start"
-      ;;
-    */postgres/physical/*.tar.gz)
-      backup_restore_physical_postgres_command "$backup_file" "$(backup_paths_root)"
-      ;;
-    */files/*.tar.gz)
-      backup_restore_files_command "$backup_file"
-      ;;
-    *)
-      die "Unsupported backup archive type: ${backup_file}"
-      ;;
-  esac
-
-  log "BACKUP" "Restore completed: ${backup_file}"
-}
-
-backup_files_command() {
-  local label="${1:-}"
-  shift || true
-
-  [ -n "$label" ] || die "Usage: ${SCRIPT_NAME} backup files <label> <path...>"
-  [ "$#" -gt 0 ] || die "Usage: ${SCRIPT_NAME} backup files <label> <path...>"
-
-  local stack_root timestamp out_file tmp_file p
-  ensure_env_file
-  load_env_if_exists
-  ensure_structure
-
-  stack_root="$(backup_paths_root)"
-  mkdir -p "${stack_root}/files"
-  timestamp="$(date +%Y%m%d-%H%M%S)"
-  out_file="${stack_root}/files/${STACK_ID}-${label}-${timestamp}.tar.gz"
-  tmp_file="${out_file}.tmp"
-
-  for p in "$@"; do
-    [ -e "${SCRIPT_DIR}/${p}" ] || die "Path not found for backup: ${p}"
+  local seen=""
+  for idx in "${indexes[@]}"; do
+    id="${SNAPSHOT_IDS[$idx]}"
+    case " $seen " in
+      *" $id "*)
+        continue
+        ;;
+    esac
+    seen="${seen}${id} "
+    path="$(backup_snapshots_dir)/${id}"
+    rm -rf "$path"
+    log "BACKUP" "Deleted snapshot [${idx}] ${id}"
   done
-
-  tar -C "$SCRIPT_DIR" -czf "$tmp_file" "$@" || {
-    rm -f "$tmp_file"
-    die "Failed to create file backup archive"
-  }
-
-  [ -s "$tmp_file" ] || die "File backup is empty"
-  gzip -t "$tmp_file" || die "File backup archive is invalid"
-  mv "$tmp_file" "$out_file"
-  checksum_file_for "$out_file"
-
-  log "BACKUP" "Created file backup: ${out_file}"
 }
 
 backup_command() {
-  local action="${1:-}"
-  case "$action" in
-    run)
-      shift
-      backup_run_command "$@"
-      ;;
-    list)
-      backup_list_command
-      ;;
-    verify)
-      backup_verify_command "${2:-}"
-      ;;
-    restore)
-      shift
-      backup_restore_command "$@"
-      ;;
-    files)
-      shift
-      backup_files_command "$@"
-      ;;
-    *)
-      die "Usage: ${SCRIPT_NAME} backup <run|list|verify|restore|files>"
-      ;;
-  esac
+  local arg1="${1:-}"
+
+  if [ -z "$arg1" ]; then
+    die "Usage: ${SCRIPT_NAME} backup <path...|--full|list|delete>"
+  fi
+
+  if [ "$arg1" = "list" ]; then
+    resolve_snapshot_ids
+    [ "${#SNAPSHOT_IDS[@]}" -gt 0 ] || {
+      log "BACKUP" "No snapshots found in $(backup_snapshots_dir)"
+      return
+    }
+
+    local i id
+    for i in "${!SNAPSHOT_IDS[@]}"; do
+      id="${SNAPSHOT_IDS[$i]}"
+      printf '[%s] %s  (%s)\n' "$i" "$id" "$(timestamp_to_human "$id")"
+    done
+    return
+  fi
+
+  if [ "$arg1" = "--full" ]; then
+    local candidates=("compose.yaml" "setup.sh")
+    local dir base
+    shopt -s nullglob
+    for dir in "${SCRIPT_DIR}"/*; do
+      [ -d "$dir" ] || continue
+      base="$(basename "$dir")"
+      if [ "$base" = "backups" ] || [ "$base" = ".git" ]; then
+        continue
+      fi
+      candidates+=("$base")
+    done
+    shopt -u nullglob
+
+    local selected=()
+    local p
+    for p in "${candidates[@]}"; do
+      if [ -e "${SCRIPT_DIR}/${p}" ]; then
+        selected+=("$p")
+      fi
+    done
+    [ "${#selected[@]}" -gt 0 ] || die "Nothing to backup for --full"
+    backup_create_snapshot "full" "${selected[@]}"
+    return
+  fi
+
+  if [ "$arg1" = "delete" ]; then
+    shift
+    backup_delete_command "$@"
+    return
+  fi
+
+  backup_create_snapshot "partial" "$@"
+}
+
+restore_command() {
+  local idx=0
+  local merge=0
+  local force=0
+  local args=()
+
+  if [ "$#" -gt 0 ] && [[ "$1" =~ ^[0-9]+$ ]]; then
+    idx="$1"
+    shift
+  fi
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --merge)
+        merge=1
+        ;;
+      --yes)
+        force=1
+        ;;
+      *)
+        args+=("$1")
+        ;;
+    esac
+    shift
+  done
+
+  [ "${#args[@]}" -gt 0 ] || die "Usage: ${SCRIPT_NAME} restore [index] <path...> [--merge] [--yes]"
+
+  local snapshot_dir snapshot_id path src dst
+  snapshot_dir="$(snapshot_dir_by_index "$idx")"
+  snapshot_id="$(basename "$snapshot_dir")"
+
+  if [ "$force" -ne 1 ]; then
+    local confirmation
+    read -r -p "Type 'restore' to restore from snapshot ${snapshot_id}: " confirmation
+    [ "$confirmation" = "restore" ] || die "Cancelled"
+  fi
+
+  for path in "${args[@]}"; do
+    validate_project_relative_path "$path"
+    src="${snapshot_dir}/${path}"
+    [ -e "$src" ] || die "Path '${path}' not found in snapshot ${snapshot_id}"
+    dst="${SCRIPT_DIR}/${path}"
+
+    if [ "$merge" -eq 1 ]; then
+      if [ -d "$src" ]; then
+        mkdir -p "$dst"
+        cp -a "$src"/. "$dst"/
+      else
+        mkdir -p "$(dirname "$dst")"
+        cp -a "$src" "$dst"
+      fi
+    else
+      rm -rf "$dst"
+      mkdir -p "$(dirname "$dst")"
+      cp -a "$src" "$dst"
+    fi
+  done
+
+  log "RESTORE" "Completed from snapshot ${snapshot_id}"
 }
 
 harden_audit_command() {
@@ -1651,14 +1497,14 @@ reborn_command() {
   keep_name="$(basename "$0")"
   for path in "${SCRIPT_DIR}"/*; do
     base="$(basename "$path")"
-    if [ "$base" = ".git" ] || [ "$base" = "$keep_name" ] || [ "$base" = "README.md" ] || [ "$base" = "LICENSE" ]; then
+    if [ "$base" = ".git" ] || [ "$base" = "$keep_name" ] || [ "$base" = "README.md" ] || [ "$base" = "LICENSE" ] || [ "$base" = "backups" ]; then
       continue
     fi
     rm -rf "$path"
   done
   shopt -u dotglob nullglob
 
-  log "REBIRTH" "Project fully reset. Kept: ${keep_name}, README.md, .git, LICENSE"
+  log "REBIRTH" "Project fully reset. Kept: ${keep_name}, README.md, .git, LICENSE, backups"
 }
 
 init_command() {
@@ -1748,14 +1594,14 @@ Commands:
   env                          Regenerate values for every *_SECRET key in .env
   validate                     Validate .env and docker compose config
   harden audit                 Run basic production hardening checks
-  backup run [opts]            Create Postgres backup (--physical|--logical|--full)
-  backup list                  List valid backup archives for current stack
-  backup verify [file]         Verify backup integrity (latest when omitted)
-  backup restore [file] [--yes] [--auto-start] [--logical|--physical] Restore backup archive
-  backup files <label> <paths...> Create file/folder backup archive
+  backup <path...>             Snapshot selected project paths
+  backup --full                Snapshot whole project state
+  backup list                  List snapshots (newest first)
+  backup delete <idx...>       Delete snapshot(s) by list index
+  restore [idx] <path...>      Restore paths from snapshot index (0 = latest, --merge optional)
   security scan                Run Trivy filesystem/config scan
   reset <database|trae>        Reset database password or Traefik password
-  reborn [--yes|--fuckit]      Remove generated files, keep setup.sh README.md .git LICENSE
+  reborn [--yes|--fuckit]      Remove generated files, keep setup.sh README.md .git LICENSE backups
   help | -h                    Show this help
 EOF
 }
@@ -1791,6 +1637,10 @@ main() {
     backup)
       shift
       backup_command "$@"
+      ;;
+    restore)
+      shift
+      restore_command "$@"
       ;;
     security)
       shift
