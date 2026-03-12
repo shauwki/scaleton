@@ -144,51 +144,6 @@ default_tunnel_name() {
   normalize_tunnel_name "$(basename "$SCRIPT_DIR")"
 }
 
-rename_project_dir_if_needed() {
-  local target_name="$1"
-  local current_name parent_dir target_dir
-
-  [ -n "$target_name" ] || return
-  current_name="$(basename "$SCRIPT_DIR")"
-
-  if [ "$target_name" = "$current_name" ]; then
-    return
-  fi
-
-  case "$target_name" in
-    */*)
-      die "Folder name cannot contain '/'"
-      ;;
-  esac
-
-  parent_dir="$(dirname "$SCRIPT_DIR")"
-  target_dir="${parent_dir}/${target_name}"
-
-  if [ -e "$target_dir" ]; then
-    die "Cannot rename folder; target already exists: ${target_dir}"
-  fi
-
-  mv "$SCRIPT_DIR" "$target_dir"
-
-  SCRIPT_DIR="$target_dir"
-  cd "$SCRIPT_DIR"
-  log "INIT" "Project directory renamed to: ${target_name}"
-  log "INIT" "Change directory before docker commands: cd ${target_dir}"
-}
-
-prompt_directory_rename() {
-  local current_name target_name
-  current_name="$(basename "$SCRIPT_DIR")"
-  target_name=$(prompt_value "Rename project folder to (empty keeps ${current_name})" "")
-
-  if [ -z "$target_name" ]; then
-    log "INIT" "Directory name unchanged: ${current_name}"
-    return
-  fi
-
-  rename_project_dir_if_needed "$target_name"
-}
-
 run_privileged() {
   if [ "$(id -u)" -eq 0 ]; then
     "$@"
@@ -607,12 +562,34 @@ delete_cloudflared_tunnel_if_exists() {
 }
 
 ensure_structure() {
+  migrate_legacy_layout
+
   mkdir -p ./core/traefik
   mkdir -p ./core/database
   mkdir -p ./core/cloudflared
   mkdir -p ./core/testsite
-  mkdir -p ./services/postgres/data
+  mkdir -p ./data/postgres/data
   mkdir -p "${BACKUP_ROOT}/snapshots"
+}
+
+migrate_legacy_layout() {
+  local legacy_data="${SCRIPT_DIR}/services/postgres/data"
+  local new_root="${SCRIPT_DIR}/data/postgres"
+  local new_data="${new_root}/data"
+
+  if [ -d "$legacy_data" ] && [ ! -d "$new_data" ]; then
+    mkdir -p "$new_root"
+    mv "$legacy_data" "$new_data"
+    log "MIGRATE" "Moved postgres data to data/postgres/data"
+  fi
+
+  if [ -d "${SCRIPT_DIR}/services/postgres" ] && [ -z "$(ls -A "${SCRIPT_DIR}/services/postgres" 2>/dev/null)" ]; then
+    rmdir "${SCRIPT_DIR}/services/postgres" >/dev/null 2>&1 || true
+  fi
+
+  if [ -d "${SCRIPT_DIR}/services" ] && [ -z "$(ls -A "${SCRIPT_DIR}/services" 2>/dev/null)" ]; then
+    rmdir "${SCRIPT_DIR}/services" >/dev/null 2>&1 || true
+  fi
 }
 
 generate_testsite_files() {
@@ -725,15 +702,14 @@ EOF
 write_gitignore_file() {
   cat > "${SCRIPT_DIR}/.gitignore" <<'EOF'
 .env
-.gitignore
+
 # Generated security files
 core/traefik/users.htpasswd
-core/**
-compose.yaml
+
 # Runtime data
-services/postgres/data/**
-services/**
+data/**
 backups/**
+
 *.log
 *.tmp
 EOF
@@ -744,6 +720,7 @@ write_compose_file() {
 name: ${STACK_ID}
 
 services:
+  # Edge ingress and tunnel
   traefik:
     image: traefik:v3.6
     restart: unless-stopped
@@ -770,6 +747,7 @@ services:
     networks:
       - network-edge
 
+  # Example public test app
   testsite:
     image: nginx:alpine
     restart: unless-stopped
@@ -783,6 +761,7 @@ services:
       - "traefik.http.routers.testsite-${STACK_ID}.entrypoints=web"
       - "traefik.http.services.testsite-${STACK_ID}.loadbalancer.server.port=80"
 
+  # Optional database UI (disable in production)
   adminer:
     image: adminer:latest
     restart: unless-stopped
@@ -797,6 +776,7 @@ services:
       - "traefik.http.routers.adminer-${STACK_ID}.entrypoints=web"
       - "traefik.http.services.adminer-${STACK_ID}.loadbalancer.server.port=8080"
 
+  # Primary relational database
   postgres:
     image: postgres:17-alpine
     restart: unless-stopped
@@ -805,7 +785,7 @@ services:
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     volumes:
-      - ./services/postgres/data:/var/lib/postgresql/data
+      - ./data/postgres/data:/var/lib/postgresql/data
       - ./core/database/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
     networks:
       - network-db
@@ -1548,11 +1528,7 @@ reborn_command() {
 }
 
 init_command() {
-  local mode="${1:-}"
-  local do_rename=1
-  if [ "$mode" = "--no-rename" ]; then
-    do_rename=0
-  elif [ -n "$mode" ]; then
+  if [ -n "${1:-}" ]; then
     die "Usage: ${SCRIPT_NAME} init"
   fi
 
@@ -1606,10 +1582,6 @@ init_command() {
   echo "- Generated: .gitignore"
   echo
   log "NEXT" "Run ${SCRIPT_NAME} init cf (required before deploy commands)"
-
-  if [ "$do_rename" -eq 1 ]; then
-    prompt_directory_rename
-  fi
 }
 
 init_cf_command() {
